@@ -1,0 +1,203 @@
+{
+  "name": "Face Recognition",
+  "nodes": [
+    {
+      "parameters": {
+        "topic": "faces/detect",
+        "options": {}
+      },
+      "id": "mqtt-trigger",
+      "name": "MQTT Trigger",
+      "type": "n8n-nodes-base.mqttTrigger",
+      "typeVersion": 1,
+      "position": [80, 300],
+      "credentials": {
+        "mqtt": { "id": "MQTT_CREDENTIALS_ID", "name": "MQTT Broker" }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Valida y extrae el payload MQTT\nconst raw = $input.first().json;\n\nlet payload;\ntry {\n  payload = typeof raw.message === 'string' \n    ? JSON.parse(raw.message) \n    : raw.message || raw;\n} catch (e) {\n  throw new Error('Payload MQTT no es JSON válido: ' + raw.message);\n}\n\nconst imageBase64 = payload.image || payload.image_base64 || payload.data;\nif (!imageBase64 || imageBase64.length < 100) {\n  throw new Error('No se encontró imagen Base64 válida en el payload');\n}\n\n// Limpiar prefijo data:image si existe\nconst cleanBase64 = imageBase64.includes(',') \n  ? imageBase64.split(',')[1] \n  : imageBase64;\n\nreturn [{\n  json: {\n    image_base64: cleanBase64,\n    device_id: payload.device_id || 'unknown',\n    mqtt_topic: 'faces/detect',\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "validate-payload",
+      "name": "Validar Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [280, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5001/embedding",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ image_base64: $json.image_base64 }) }}"
+      },
+      "id": "deepface-embedding",
+      "name": "DeepFace - Generar Embedding",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Verifica si DeepFace detectó un rostro\nconst deepfaceResult = $input.first().json;\n\nif (!deepfaceResult.face_detected) {\n  throw new Error('No se detectó ningún rostro en la imagen');\n}\n\nconst embedding = deepfaceResult.embedding;\n\n// Formatear embedding como string de array para pgvector\n// pgvector espera: '[0.123, 0.456, ...]'\nconst embeddingStr = '[' + embedding.join(',') + ']';\n\n// Recuperar datos del nodo anterior\nconst originalData = $('Validar Payload').first().json;\n\nreturn [{\n  json: {\n    embedding: embedding,\n    embedding_str: embeddingStr,\n    device_id: originalData.device_id,\n    mqtt_topic: originalData.mqtt_topic,\n    image_base64: originalData.image_base64,\n    timestamp: originalData.timestamp\n  }\n}];"
+      },
+      "id": "process-embedding",
+      "name": "Procesar Embedding",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT face_id, person_id, person_name, distance, metadata FROM find_closest_face('{{ $json.embedding_str }}'::vector, 0.4);"
+      },
+      "id": "search-supabase",
+      "name": "Buscar en Supabase",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [880, 300],
+      "credentials": {
+        "postgres": {
+          "id": "SUPABASE_CREDENTIALS_ID",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "known-check",
+              "leftValue": "={{ $json.face_id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is-known",
+      "name": "¿Persona Conocida?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1080, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH new_person AS (\n  INSERT INTO persons (name, metadata)\n  VALUES ('Desconocido_{{ $('Procesar Embedding').item.json.timestamp }}', '{\"auto_registered\": true}')\n  RETURNING id\n),\nnew_face AS (\n  INSERT INTO face_embeddings (person_id, embedding, image_base64, confidence)\n  SELECT id, '{{ $('Procesar Embedding').item.json.embedding_str }}'::vector, '{{ $('Procesar Embedding').item.json.image_base64 }}', 1.0\n  FROM new_person\n  RETURNING id, person_id\n),\nlog_insert AS (\n  INSERT INTO detection_logs (person_id, is_known, similarity, mqtt_topic, device_id, image_base64, matched_face_id)\n  SELECT nf.person_id, false, null, '{{ $('Procesar Embedding').item.json.mqtt_topic }}', '{{ $('Procesar Embedding').item.json.device_id }}', '{{ $('Procesar Embedding').item.json.image_base64 }}', nf.id\n  FROM new_face nf\n)\nSELECT nf.person_id, nf.id AS face_id FROM new_face nf;"
+      },
+      "id": "insert-new-person",
+      "name": "Registrar Nuevo Rostro",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1280, 480],
+      "credentials": {
+        "postgres": {
+          "id": "SUPABASE_CREDENTIALS_ID",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO detection_logs (person_id, is_known, similarity, mqtt_topic, device_id, image_base64, matched_face_id)\nVALUES (\n  '{{ $('Buscar en Supabase').item.json.person_id }}'::uuid,\n  true,\n  {{ $('Buscar en Supabase').item.json.distance }},\n  '{{ $('Procesar Embedding').item.json.mqtt_topic }}',\n  '{{ $('Procesar Embedding').item.json.device_id }}',\n  '{{ $('Procesar Embedding').item.json.image_base64 }}',\n  '{{ $('Buscar en Supabase').item.json.face_id }}'::uuid\n)\nRETURNING id;"
+      },
+      "id": "log-known",
+      "name": "Registrar Acceso Conocido",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1280, 140],
+      "credentials": {
+        "postgres": {
+          "id": "SUPABASE_CREDENTIALS_ID",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Construir respuesta final hacia MQTT\nconst isKnown = $('¿Persona Conocida?').first()?.json?.face_id != null;\n\nlet result;\nif (isKnown) {\n  const match = $('Buscar en Supabase').first().json;\n  result = {\n    status: 'known',\n    person_id: match.person_id,\n    person_name: match.person_name,\n    similarity: (1 - match.distance).toFixed(4),\n    confidence: 'high'\n  };\n} else {\n  const newPerson = $('Registrar Nuevo Rostro').first().json;\n  result = {\n    status: 'unknown',\n    person_id: newPerson.person_id,\n    message: 'Rostro registrado como nuevo',\n    confidence: 'new_entry'\n  };\n}\n\nreturn [{ json: { payload: JSON.stringify(result) } }];"
+      },
+      "id": "build-response",
+      "name": "Construir Respuesta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 300]
+    },
+    {
+      "parameters": {
+        "topic": "faces/result",
+        "message": "={{ $json.payload }}",
+        "options": {}
+      },
+      "id": "mqtt-publish",
+      "name": "MQTT Publish - Resultado",
+      "type": "n8n-nodes-base.mqtt",
+      "typeVersion": 1,
+      "position": [1700, 300],
+      "credentials": {
+        "mqtt": { "id": "MQTT_CREDENTIALS_ID", "name": "MQTT Broker" }
+      }
+    }
+  ],
+  "connections": {
+    "MQTT Trigger": {
+      "main": [[{ "node": "Validar Payload", "type": "main", "index": 0 }]]
+    },
+    "Validar Payload": {
+      "main": [
+        [{ "node": "DeepFace - Generar Embedding", "type": "main", "index": 0 }]
+      ]
+    },
+    "DeepFace - Generar Embedding": {
+      "main": [[{ "node": "Procesar Embedding", "type": "main", "index": 0 }]]
+    },
+    "Procesar Embedding": {
+      "main": [[{ "node": "Buscar en Supabase", "type": "main", "index": 0 }]]
+    },
+    "Buscar en Supabase": {
+      "main": [[{ "node": "¿Persona Conocida?", "type": "main", "index": 0 }]]
+    },
+    "¿Persona Conocida?": {
+      "main": [
+        [{ "node": "Registrar Acceso Conocido", "type": "main", "index": 0 }],
+        [{ "node": "Registrar Nuevo Rostro", "type": "main", "index": 0 }]
+      ]
+    },
+    "Registrar Acceso Conocido": {
+      "main": [[{ "node": "Construir Respuesta", "type": "main", "index": 0 }]]
+    },
+    "Registrar Nuevo Rostro": {
+      "main": [[{ "node": "Construir Respuesta", "type": "main", "index": 0 }]]
+    },
+    "Construir Respuesta": {
+      "main": [
+        [{ "node": "MQTT Publish - Resultado", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "meta": { "templateId": "face-recognition-deepface-supabase" }
+}
