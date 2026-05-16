@@ -1,0 +1,77 @@
+version: "3.9"
+
+networks:
+  face-net:
+    driver: bridge
+
+volumes:
+  n8n_data:
+  mosquitto_data:
+  mosquitto_logs:
+
+services:
+  # ── 1. MQTT Broker ─────────────────────────────────────────
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: face-mosquitto
+    restart: unless-stopped
+    networks:
+      - face-net
+    ports:
+      - "1883:1883" # MQTT TCP
+      - "9001:9001" # WebSocket
+    volumes:
+      - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_logs:/mosquitto/log
+
+  # ── 2. DeepFace API ────────────────────────────────────────
+  deepface-api:
+    build:
+      context: ./deepface
+      dockerfile: Dockerfile
+    container_name: face-deepface
+    restart: unless-stopped
+    networks:
+      - face-net
+    ports:
+      - "5001:5001" # Expuesto para debug
+    environment:
+      - FLASK_ENV=production
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s # DeepFace tarda en cargar
+
+  # ── 3. n8n ─────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: face-n8n
+    restart: unless-stopped
+    networks:
+      - face-net
+    ports:
+      - "5678:5678"
+    environment:
+      # Autenticación básica
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-changeme}
+      # URL pública
+      - WEBHOOK_URL=http://localhost:5678/
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      # Timezone
+      - GENERIC_TIMEZONE=America/Bogota
+      - TZ=America/Bogota
+    volumes:
+      - n8n_data:/home/node/.n8n
+      # Monta el workflow para importarlo automáticamente al iniciar
+      - ./n8n-import:/home/node/import:ro
+    depends_on:
+      deepface-api:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
