@@ -75,4 +75,4 @@ make clean         # Eliminar todo (incluye volúmenes)
 | n8n      | 5678   | UI del workflow               |
 | DeepFace | 5001   | API de reconocimiento         |
 | MQTT TCP | 1883   | OpenCV publisher conecta aquí |
-| MQTT WS  | 9001   | WebSocket (opcional)          |
+| MQTT WS  | 9001   | WebSocket                     |
