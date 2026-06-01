@@ -60,7 +60,7 @@ def get_embedding():
         result = DeepFace.represent(
             img_path=img,
             model_name="Facenet512",   # Alta precisión, ~512 dims
-            enforce_detection=True,
+            enforce_detection=False,
             detector_backend="opencv"
         )
 
